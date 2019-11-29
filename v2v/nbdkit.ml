@@ -145,6 +145,16 @@ let common_create ?bandwidth plugin_name plugin_args plugin_env =
     Sys.command cmd <> 0
   in
 
+  (* If using verbose mode, show also stats; the filter is installed first
+   * to reflect the entire stack seen by qemu-img.
+   *)
+  let stats_args =
+    if verbose () && probe_filter "stats" then (
+      add_arg "--filter"; add_arg "stats";
+      [ "statsfile=/dev/stderr" ]
+    )
+    else [] in
+
   (* Adding the readahead filter is always a win for our access
    * patterns.  However if it doesn't exist don't worry.
    *)
@@ -183,7 +193,7 @@ let common_create ?bandwidth plugin_name plugin_args plugin_env =
     add_arg "--filter"; add_arg "retry"
   );
 
-  let args = get_args () @ [ plugin_name ] @ plugin_args @ rate_args in
+  let args = get_args () @ [ plugin_name ] @ plugin_args @ stats_args @ rate_args in
 
   { plugin_name; args; env; dump_config; dump_plugin }
 
