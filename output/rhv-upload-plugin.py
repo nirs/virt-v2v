@@ -20,6 +20,8 @@ import json
 import queue
 import socket
 import ssl
+import threading
+import time
 
 from contextlib import contextmanager
 from http.client import HTTPSConnection, HTTPConnection
@@ -33,6 +35,9 @@ API_VERSION = 2
 # Maximum number of connection to imageio server. Based on testing with imageio
 # client, this give best performance.
 MAX_CONNECTIONS = 4
+
+# If connection is idle for this interval, we send a flush request.
+IDLE_TIMEOUT = 30
 
 # Required parameters.
 size = None
@@ -48,6 +53,9 @@ options = None
 
 # Pool of HTTP connections.
 pool = None
+
+# Set when plugin is closed.
+done = threading.Event()
 
 
 # Parse parameters.
@@ -95,6 +103,7 @@ def after_fork():
 # doesn't particularly matter if we don't close the pool because
 # clients should call flush().
 def cleanup():
+    done.set()
     close_http_pool(pool)
 
 
@@ -278,22 +287,43 @@ def emulate_zero(h, count, offset, flags):
 
 
 def flush(h, flags):
-    # Construct the JSON request for flushing.
+    """
+    Wait until all inflight requests are done, and send flush request
+    for every connection.
+    """
+    locked = []
+
+    # Lock the pool by taking the connection out.
+    while len(locked) < pool.qsize():
+        locked.append(pool.get())
+
+    try:
+        now = time.monotonic()
+        for item in locked:
+            if item.error:
+                raise RuntimeError(f"Periodic flush failed: {item.error}")
+
+            send_flush(item.http)
+            item.last_used = now
+    finally:
+        # Unlock the pool by puting the connection back.
+        for item in locked:
+            pool.put(item)
+
+
+def send_flush(http):
     buf = json.dumps({'op': "flush"}).encode()
 
     headers = {"Content-Type": "application/json",
                "Content-Length": str(len(buf))}
 
-    # Wait until all inflight requests are completed, and send a flush
-    # request for all imageio connections.
-    for http in iter_http_pool(pool):
-        http.request("PATCH", url.path, body=buf, headers=headers)
+    http.request("PATCH", url.path, body=buf, headers=headers)
 
-        r = http.getresponse()
-        if r.status != 200:
-            request_failed(r, "could not flush")
+    r = http.getresponse()
+    if r.status != 200:
+        request_failed(r, "could not flush")
 
-        r.read()
+    r.read()
 
 
 # Modify http.client.HTTPConnection to work over a Unix domain socket.
@@ -312,6 +342,14 @@ class UnixHTTPConnection(HTTPConnection):
         self.sock.connect(self.path)
 
 
+class PoolItem:
+
+    def __init__(self, http):
+        self.http = http
+        self.error = None
+        self.last_used = None
+
+
 # Connection pool.
 def create_http_pool(url, options):
     pool = queue.Queue()
@@ -326,9 +364,53 @@ def create_http_pool(url, options):
 
     for i in range(count):
         http = create_http(url, unix_socket=unix_socket)
-        pool.put(http)
+        pool.put(PoolItem(http))
+
+    t = threading.Thread(target=pool_keeper)
+    t.daemon = True
+    t.start()
 
     return pool
+
+
+def pool_keeper():
+    """
+    Thread flushing idle connections, keeping them alive.
+
+    If connection is idle for 60 seconds, imageio server close it.
+    Recovering from closed connection is hard and unsafe, so we make sure it
+    never happens.
+
+    If flush failed, we keep the error and report it on the next
+    request.
+    """
+    nbdkit.debug("pool keeper started")
+
+    while not done.wait(IDLE_TIMEOUT / 2):
+        idle = []
+
+        while True:
+            try:
+                idle.append(pool.get_nowait())
+            except queue.Empty:
+                break
+
+        if idle:
+            now = time.monotonic()
+
+            for item in idle:
+                if item.last_used and now - item.last_used > IDLE_TIMEOUT:
+                    nbdkit.debug("flushing idle connection")
+                    try:
+                        send_flush(item.http)
+                    except Exception as e:
+                        item.error = e
+                    item.last_used = now
+                    pool.put(item)
+                else:
+                    pool.put(item)
+
+    nbdkit.debug("pool keeper stopped")
 
 
 @contextmanager
@@ -336,35 +418,18 @@ def http_context(pool):
     """
     Context manager yielding an imageio http connection from the pool. Blocks
     until a connection is available.
+
+    Raises if a connection failed to flush while it was idle.
     """
-    http = pool.get()
+    item = pool.get()
     try:
-        yield http
+        if item.error:
+            raise RuntimeError(f"Periodic flush failed: {item.error}")
+
+        yield item.http
     finally:
-        pool.put(http)
-
-
-def iter_http_pool(pool):
-    """
-    Wait until all inflight requests are done, and iterate on imageio
-    connections.
-
-    The pool is empty during iteration. New requests issued during iteration
-    will block until iteration is done.
-    """
-    locked = []
-
-    # Lock the pool by taking the connection out.
-    while len(locked) < pool.qsize():
-        locked.append(pool.get())
-
-    try:
-        for http in locked:
-            yield http
-    finally:
-        # Unlock the pool by puting the connection back.
-        for http in locked:
-            pool.put(http)
+        item.last_used = time.monotonic()
+        pool.put(item)
 
 
 def close_http_pool(pool):
@@ -381,8 +446,8 @@ def close_http_pool(pool):
     while len(locked) < pool.qsize():
         locked.append(pool.get())
 
-    for http in locked:
-        http.close()
+    for item in locked:
+        item.http.close()
 
 
 def create_http(url, unix_socket=None):
