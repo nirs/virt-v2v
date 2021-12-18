@@ -178,7 +178,7 @@ let with_nbd_connect_unix ~socket ~meta_contexts ~f =
     ~finally:(fun () -> NBD.close nbd)
 
 let get_disk_allocated ~dir ~disknr =
-  let socket = sprintf "%s/out%d" dir disknr
+  let socket = sprintf "%s/in%d" dir disknr
   and alloc_ctx = "base:allocation" in
   with_nbd_connect_unix ~socket ~meta_contexts:[alloc_ctx]
     ~f:(fun nbd ->
